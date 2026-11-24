@@ -1,0 +1,181 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+)
+
+func putTestFile(t *testing.T, root, rel, body string) {
+	t.Helper()
+	path := filepath.Join(root, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGenerateProblemExtern(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(t.TempDir(), "stage")
+	for _, stem := range []string{
+		"外层 目录/子任务一/sum01",
+		"外层 目录/子任务二/sUm_2",
+		"资料/01sum",
+		"资料/ab2cd3",
+		"graph/long-Path_9",
+		"graph/magic_word.1",
+		"misleading-folder/a1_2",
+		"plain",
+	} {
+		putTestFile(t, root, stem+".IN", "")
+		putTestFile(t, root, stem+".AnS", "")
+	}
+	putTestFile(t, root, "readme.txt", "ignore")
+	putTestFile(t, root, "only_input/dice03.in", "")
+	putTestFile(t, root, "other_place/dice03.ans", "")
+	putTestFile(t, root, "numeric/01.in", "")
+	putTestFile(t, root, "orphan.ans", "")
+	putTestFile(t, root, problemListName, "from archive")
+	putTestFile(t, base, problemListName, "previous run")
+	if err := os.Chmod(filepath.Join(base, problemListName), 0444); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := scanProblems(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"a", "abcd", "dice", "long-Path", "magic_word", "plain", "sum"}
+	wantSkipped := []string{filepath.Join("numeric", "01.in")}
+	if summary.Inputs != 10 || summary.Paired != 8 || !reflect.DeepEqual(summary.Problems, want) ||
+		!reflect.DeepEqual(summary.Skipped, wantSkipped) {
+		t.Fatalf("unexpected summary %+v", summary)
+	}
+	dest, err := publishResult(base, root, summary.Problems, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.ReadFile(filepath.Join(dest, problemListName))
+	if err != nil || string(original) != "from archive" {
+		t.Fatalf("changed archive member %q, err %v", original, err)
+	}
+	body, err := os.ReadFile(filepath.Join(base, problemListName))
+	if err != nil || string(body) != strings.Join(want, "\r\n")+"\r\n" {
+		t.Fatalf("output %q, err %v", body, err)
+	}
+}
+
+func TestInvalidDataPreservesProblemExtern(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		paths []string
+		want  string
+	}{
+		{"empty", []string{"readme"}, "没有找到"},
+		{"only answer files", []string{"tree01.ans"}, ".in"},
+		{"numeric only", []string{"tree/1.in", "tree/1.ans"}, "英文题名"},
+		{"no English name", []string{"题目01.in"}, "英文题名"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			putTestFile(t, root, "problem.extern", "existing")
+			for _, p := range tc.paths {
+				putTestFile(t, root, p, "")
+			}
+			_, err := scanProblems(root)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error %v, want %q", err, tc.want)
+			}
+			out, err := os.ReadFile(filepath.Join(root, "problem.extern"))
+			if err != nil || string(out) != "existing" {
+				t.Fatalf("previous output %q, err %v", out, err)
+			}
+		})
+	}
+}
+
+func TestProblemExternPreservesLinkTarget(t *testing.T) {
+	root := t.TempDir()
+	otherDir := t.TempDir()
+	target := filepath.Join(otherDir, "keep.txt")
+	putTestFile(t, otherDir, "keep.txt", "untouched")
+	putTestFile(t, root, "new-list", "example\r\n")
+	dest := filepath.Join(root, problemListName)
+	if err := os.Symlink(target, dest); err != nil {
+		t.Skipf("cannot create a symbolic link on this system: %v", err)
+	}
+	if err := replaceProblemList(filepath.Join(root, "new-list"), dest); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(target)
+	if err != nil || string(body) != "untouched" {
+		t.Fatalf("link target %q, err %v", body, err)
+	}
+}
+
+func TestPublishResultsWithinOneSecond(t *testing.T) {
+	base := t.TempDir()
+	stamp := time.Date(2026, 11, 24, 14, 30, 52, 0, time.Local)
+	first := "down20261124_143052"
+	if err := os.Mkdir(filepath.Join(base, first), 0700); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	done := make(chan error, 2)
+	for _, name := range []string{"red", "blue"} {
+		stage := filepath.Join(t.TempDir(), "stage")
+		putTestFile(t, stage, name+".in", name)
+		go func() {
+			<-start
+			dest, err := publishResult(base, stage, []string{name}, stamp)
+			if err == nil {
+				got, readErr := os.ReadFile(filepath.Join(dest, name+".in"))
+				if string(got) != name || readErr != nil {
+					err = fmt.Errorf("result contains %q, read error %v", got, readErr)
+				}
+			}
+			done <- err
+		}()
+	}
+	close(start)
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if entries, err := os.ReadDir(filepath.Join(base, first)); err != nil || len(entries) != 0 {
+		t.Fatalf("preexisting folder changed: %v, %v", entries, err)
+	}
+	for _, suffix := range []string{"_2", "_3"} {
+		if _, err := os.Stat(filepath.Join(base, first+suffix)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	list, err := os.ReadFile(filepath.Join(base, problemListName))
+	if err != nil || (string(list) != "red\r\n" && string(list) != "blue\r\n") {
+		t.Fatalf("incomplete manifest: %q, %v", list, err)
+	}
+}
+
+func TestPublishRollsBackWhenListCannotBeReplaced(t *testing.T) {
+	base := t.TempDir()
+	putTestFile(t, base, problemListName+"/keep.txt", "keep")
+	stage := filepath.Join(t.TempDir(), "stage")
+	putTestFile(t, stage, "sum1.in", "1")
+	if _, err := publishResult(base, stage, []string{"sum"}, time.Now()); err == nil {
+		t.Fatal("expected publication to fail with a directory in the manifest's place")
+	}
+	entries, err := os.ReadDir(base)
+	if err != nil || len(entries) != 1 || entries[0].Name() != problemListName {
+		t.Fatalf("partial publication: %v, %v", entries, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(base, problemListName, "keep.txt")); err != nil || string(got) != "keep" {
+		t.Fatalf("original content changed: %q, %v", got, err)
+	}
+}
