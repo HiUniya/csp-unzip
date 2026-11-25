@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -28,24 +29,6 @@ func run(ctx context.Context, base string, ask passwordPrompt, out io.Writer, in
 		return fmt.Errorf("外层压缩包应为普通文件：%s", outer)
 	}
 	fmt.Fprintf(out, "外层包：%s\n内层包：%s\n\n", c.outer, c.inner)
-	// Staging beside the destination allows publishing the complete tree with one rename.
-	work, err := os.MkdirTemp(base, ".csp-unzip-")
-	if err != nil {
-		return fmt.Errorf("无法在程序目录创建暂存目录：%w", err)
-	}
-	defer func() {
-		if err := removeWorkDir(work); err != nil {
-			fmt.Fprintf(out, "临时目录清理失败：%s（%v）\n", work, err)
-		}
-	}()
-	exe, err := install7Zip(work)
-	if err != nil {
-		return fmt.Errorf("释放内置 7-Zip 失败：%w", err)
-	}
-	stage := filepath.Join(work, "result")
-	if err := os.Mkdir(stage, 0700); err != nil {
-		return err
-	}
 	getPassword := func(layer string, retry bool) ([]byte, error) {
 		if retry {
 			fmt.Fprintln(out, layer+"密码错误，请重新输入。")
@@ -56,19 +39,35 @@ func run(ctx context.Context, base string, ask passwordPrompt, out io.Writer, in
 		}
 		return password, err
 	}
-	if err := extractLayers(ctx, exe, outer, c.inner, work, stage, getPassword); err != nil {
+	var dest string
+	var summary scanSummary
+	err = withWorkDir(base, func(work string) error {
+		exe, err := install7Zip(work)
+		if err != nil {
+			return fmt.Errorf("释放内置 7-Zip 失败：%w", err)
+		}
+		stage := filepath.Join(work, "result")
+		if err := os.Mkdir(stage, 0700); err != nil {
+			return err
+		}
+		if err := extractLayers(ctx, exe, outer, c.inner, work, stage, getPassword); err != nil {
+			return err
+		}
+		fmt.Fprintln(out, "正在扫描测试数据……")
+		summary, err = scanProblems(stage)
+		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		dest, err = publishResult(base, stage, summary.Problems, time.Now())
 		return err
-	}
-	fmt.Fprintln(out, "正在扫描测试数据……")
-	summary, err := scanProblems(stage)
+	})
 	if err != nil {
-		return err
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	dest, err := publishResult(base, stage, summary.Problems, time.Now())
-	if err != nil {
+		if dest != "" {
+			return fmt.Errorf("解压目录已保存到 %s，清单已保存到 %s。\n%w", dest, filepath.Join(base, problemListName), err)
+		}
 		return err
 	}
 	for _, skipped := range summary.Skipped {
@@ -79,7 +78,33 @@ func run(ctx context.Context, base string, ask passwordPrompt, out io.Writer, in
 	return nil
 }
 
+// Stage on the destination volume so the completed tree can be renamed into place.
+func withWorkDir(base string, use func(string) error) (err error) {
+	work, err := os.MkdirTemp(base, ".csp-unzip-")
+	if err != nil {
+		return fmt.Errorf("无法在程序目录创建暂存目录：%w", err)
+	}
+	defer func() {
+		if cleanupErr := removeWorkDir(work); cleanupErr != nil {
+			err = errors.Join(err, fmt.Errorf("临时目录未能删除：%s（%w）。关闭占用它的程序后可手动删除此目录", work, cleanupErr))
+		}
+	}()
+	return use(work)
+}
+
 func removeWorkDir(path string) error {
+	err := tryRemoveWorkDir(path)
+	for _, delayMS := range [...]int{50, 100, 200, 400, 800, 1000} {
+		if !retryableCleanupError(err) {
+			break
+		}
+		time.Sleep(time.Duration(delayMS) * time.Millisecond)
+		err = tryRemoveWorkDir(path)
+	}
+	return err
+}
+
+func tryRemoveWorkDir(path string) error {
 	if err := os.RemoveAll(path); err == nil {
 		return nil
 	}

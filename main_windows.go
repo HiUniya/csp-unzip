@@ -109,6 +109,9 @@ func mainCode() int {
 	}
 	if ctx.Err() != nil {
 		fmt.Fprintln(os.Stderr, "操作已取消。")
+		if err != nil && err != ctx.Err() {
+			fmt.Fprintln(os.Stderr, err)
+		}
 		return 1
 	}
 	if err != nil {

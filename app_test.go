@@ -13,6 +13,21 @@ import (
 	"testing"
 )
 
+type checkCompletion struct {
+	t    *testing.T
+	base string
+}
+
+func (c checkCompletion) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte("完成。")) {
+		leftovers, err := filepath.Glob(filepath.Join(c.base, ".csp-unzip-*"))
+		if err != nil || len(leftovers) != 0 {
+			c.t.Errorf("reported completion before cleanup: %v, %v", leftovers, err)
+		}
+	}
+	return len(p), nil
+}
+
 func TestConfigWindowsNames(t *testing.T) {
 	base := t.TempDir()
 	const template = "# 配置\r\nouter_archive = 外层 文件.zip\r\ninner_archive = 试题\\内层.7z\r\n"
@@ -94,7 +109,7 @@ func TestRunPublishesCompleteResult(t *testing.T) {
 			return []byte(p), nil
 		}
 		var log bytes.Buffer
-		err := run(context.Background(), base, ask, &log, func(string) (string, error) { return exe, nil })
+		err := run(context.Background(), base, ask, io.MultiWriter(&log, checkCompletion{t, base}), func(string) (string, error) { return exe, nil })
 		if leftovers, _ := filepath.Glob(filepath.Join(base, ".csp-unzip-*")); len(leftovers) != 0 {
 			t.Fatalf("temporary directories still present: %v", leftovers)
 		}
