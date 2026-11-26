@@ -18,8 +18,9 @@ func run(ctx context.Context, base string, ask passwordPrompt, out io.Writer, in
 		return err
 	}
 	outer := filepath.Join(base, c.outer)
-	if strings.EqualFold(c.outer, problemListName) {
-		return fmt.Errorf("外层压缩包与题名清单同名，请重命名压缩包并更新 %s", configName)
+	checkerPath := filepath.Join(base, checkerConfigName)
+	if strings.EqualFold(c.outer, checkerConfigName) {
+		return fmt.Errorf("外层压缩包与检查器配置同名，请重命名压缩包并更新 %s", configName)
 	}
 	info, err := os.Stat(outer)
 	if err != nil {
@@ -27,6 +28,9 @@ func run(ctx context.Context, base string, ask passwordPrompt, out io.Writer, in
 	}
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("外层压缩包应为普通文件：%s", outer)
+	}
+	if _, err := checkerFileInfo(checkerPath); err != nil {
+		return err
 	}
 	fmt.Fprintf(out, "外层包：%s\n内层包：%s\n\n", c.outer, c.inner)
 	getPassword := func(layer string, retry bool) ([]byte, error) {
@@ -66,15 +70,15 @@ func run(ctx context.Context, base string, ask passwordPrompt, out io.Writer, in
 	})
 	if err != nil {
 		if dest != "" {
-			return fmt.Errorf("解压目录已保存到 %s，清单已保存到 %s。\n%w", dest, filepath.Join(base, problemListName), err)
+			return fmt.Errorf("解压目录已保存到 %s，已更新 %s 的 problems。\n%w", dest, checkerPath, err)
 		}
 		return err
 	}
 	for _, skipped := range summary.Skipped {
 		fmt.Fprintf(out, "未识别出英文题名，已跳过：%s\n", skipped)
 	}
-	fmt.Fprintf(out, "完成。共扫描 %d 个 .in 文件，其中 %d 个在同目录有同名 .ans，生成 %d 个题名。\n解压目录：%s\n清单：%s\n",
-		summary.Inputs, summary.Paired, len(summary.Problems), dest, filepath.Join(base, problemListName))
+	fmt.Fprintf(out, "完成。共扫描 %d 个 .in 文件，其中 %d 个在同目录有同名 .ans，已将 %d 道题写入 problems。\n解压目录：%s\n检查器配置：%s\n",
+		summary.Inputs, summary.Paired, len(summary.Problems), dest, checkerPath)
 	return nil
 }
 
@@ -93,13 +97,17 @@ func withWorkDir(base string, use func(string) error) (err error) {
 }
 
 func removeWorkDir(path string) error {
-	err := tryRemoveWorkDir(path)
+	return retryFileOperation(func() error { return tryRemoveWorkDir(path) })
+}
+
+func retryFileOperation(operation func() error) error {
+	err := operation()
 	for _, delayMS := range [...]int{50, 100, 200, 400, 800, 1000} {
 		if !retryableCleanupError(err) {
 			break
 		}
 		time.Sleep(time.Duration(delayMS) * time.Millisecond)
-		err = tryRemoveWorkDir(path)
+		err = operation()
 	}
 	return err
 }

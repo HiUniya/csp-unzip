@@ -130,18 +130,23 @@ func TestRunPublishesCompleteResult(t *testing.T) {
 			t.Fatalf("reading %s: got %q, want %q, error = %v", path, data, want, err)
 		}
 	}
-	manifest := filepath.Join(base, "problem.extern")
+	putTestFile(t, base, checkerConfigName, emptyCheckerFixture)
 	log, err := simulate(outerPW, innerPW)
 	if err != nil || strings.Contains(log, innerPW) || strings.Contains(log, outerPW) {
 		t.Fatalf("single-entry extraction failed: %v", err)
 	}
-	checkContents(manifest, "path\r\nsum\r\n")
+	if got := readFixtureProblems(t, base); !slices.Equal(got, []string{"path", "sum"}) {
+		t.Fatalf("first run produced %v", got)
+	}
+	if _, err := os.Lstat(filepath.Join(base, "problem.extern")); !os.IsNotExist(err) {
+		t.Fatalf("generated a legacy manifest, err = %v", err)
+	}
 	first := results()
 	if len(first) != 1 {
 		t.Fatalf("first run: output directories = %v", first)
 	}
-	if _, err := os.Stat(filepath.Join(first[0], "problem.extern")); !os.IsNotExist(err) {
-		t.Fatalf("unexpected manifest in extracted data, err = %v", err)
+	if _, err := os.Stat(filepath.Join(first[0], checkerConfigName)); !os.IsNotExist(err) {
+		t.Fatalf("unexpected checker configuration in extracted data, err = %v", err)
 	}
 	createFixture("tree03.in", "tree03.ans")
 	log, err = simulate("wrong", outerPW, "wrong", innerPW)
@@ -153,7 +158,14 @@ func TestRunPublishesCompleteResult(t *testing.T) {
 			t.Fatalf("expected one retry message for %s, got %q", layer, log)
 		}
 	}
-	checkContents(manifest, "tree\r\n")
+	if got := readFixtureProblems(t, base); !slices.Equal(got, []string{"tree"}) {
+		t.Fatalf("repeat run produced %v", got)
+	}
+	checker := filepath.Join(base, checkerConfigName)
+	lastGood, err := os.ReadFile(checker)
+	if err != nil {
+		t.Fatal(err)
+	}
 	both := results()
 	if len(both) != 2 || !slices.Contains(both, first[0]) {
 		t.Fatalf("repeat run: output directories = %v, first = %v", both, first)
@@ -164,7 +176,7 @@ func TestRunPublishesCompleteResult(t *testing.T) {
 	if after := results(); !slices.Equal(after, both) {
 		t.Fatalf("failed run: output directories changed from %v to %v", both, after)
 	}
-	checkContents(manifest, "tree\r\n")
+	checkContents(checker, string(lastGood))
 	for _, dir := range both {
 		dataFile := "tree03.in"
 		if dir == first[0] {

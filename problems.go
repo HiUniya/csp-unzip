@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const problemListName = "problem.extern"
+const checkerConfigName = "checker.cfg.json"
 
 type scanSummary struct {
 	Problems []string
@@ -92,21 +92,19 @@ var englishName = regexp.MustCompile(`^[A-Za-z]+(?:[._ -]+[A-Za-z]+)*$`)
 
 // stage is inside this run's private work directory on the destination volume.
 func publishResult(base, stage string, names []string, stamp time.Time) (string, error) {
-	pending := filepath.Join(filepath.Dir(stage), problemListName)
-	content := strings.Join(names, "\r\n") + "\r\n"
-	if err := os.WriteFile(pending, []byte(content), 0600); err != nil {
-		return "", fmt.Errorf("准备题名清单失败：%w", err)
-	}
 	dest, err := moveToDatedDirectory(stage, base, stamp)
 	if err != nil {
 		return "", fmt.Errorf("保存解压目录失败：%w", err)
 	}
-	if err := replaceProblemList(pending, filepath.Join(base, problemListName)); err != nil {
-		// The previous manifest remains in place. Withdraw only this run's data.
+	checker := filepath.Join(base, checkerConfigName)
+	if err := retryFileOperation(func() error {
+		return writeCheckerProblems(checker, filepath.Dir(stage), names)
+	}); err != nil {
+		// The previous config remains in place. Withdraw only this run's data.
 		if undoErr := os.Rename(dest, stage); undoErr != nil {
-			return "", fmt.Errorf("更新题名清单失败：%w。解压文件留在 %s（撤回目录失败：%v）", err, dest, undoErr)
+			return "", fmt.Errorf("更新 %s 失败：%w。解压文件留在 %s（撤回目录失败：%v）", checkerConfigName, err, dest, undoErr)
 		}
-		return "", fmt.Errorf("更新题名清单失败：%w", err)
+		return "", fmt.Errorf("更新 %s 失败：%w", checkerConfigName, err)
 	}
 	return dest, nil
 }
@@ -136,7 +134,45 @@ func moveToDatedDirectory(stage, base string, stamp time.Time) (string, error) {
 	}
 }
 
-func replaceProblemList(pending, dest string) error {
+func checkerFileInfo(path string) (os.FileInfo, error) {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return nil, fmt.Errorf("请将现有的 %s 放在 EXE 同目录：%w", checkerConfigName, err)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("检查器配置应为普通文件：%s", path)
+	}
+	return info, nil
+}
+
+func writeCheckerProblems(path, work string, names []string) error {
+	info, err := checkerFileInfo(path)
+	if err != nil {
+		return err
+	}
+	current, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	updated, err := updateCheckerProblems(current, names)
+	if err != nil {
+		return err
+	}
+	pending := filepath.Join(work, checkerConfigName)
+	if err := os.WriteFile(pending, updated, 0600); err != nil {
+		return err
+	}
+	defer os.Remove(pending)
+	if err := os.Chmod(pending, info.Mode().Perm()); err != nil {
+		return err
+	}
+	return replaceCheckerConfig(pending, path)
+}
+
+func replaceCheckerConfig(pending, dest string) error {
 	err := os.Rename(pending, dest)
 	if err == nil || runtime.GOOS != "windows" {
 		return err
@@ -152,7 +188,7 @@ func replaceProblemList(pending, dest string) error {
 	if err := os.Rename(pending, dest); err != nil {
 		if current, statErr := os.Lstat(dest); statErr == nil && os.SameFile(info, current) {
 			if modeErr := os.Chmod(dest, info.Mode().Perm()); modeErr != nil {
-				return fmt.Errorf("%w（恢复原清单的只读属性失败：%v）", err, modeErr)
+				return fmt.Errorf("%w（恢复检查器配置的只读属性失败：%v）", err, modeErr)
 			}
 		}
 		return err

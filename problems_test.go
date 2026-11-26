@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -21,7 +23,38 @@ func putTestFile(t *testing.T, root, rel, body string) {
 	}
 }
 
-func TestGenerateProblemExtern(t *testing.T) {
+const checkerTestPrefix = "{\r\n    \"md5_check\": [ { \"name\" : \"\", \"md5\" : \"\" } ],\r\n    \"problems\": "
+const checkerTestSuffix = ",\r\n    " + `"problem_regex": "^{0}\\\\{0}\\.(cpp|c|pas)$",` + "\r\n    \"problem_extern\": false\r\n}\r\n"
+const emptyCheckerFixture = checkerTestPrefix + "[]" + checkerTestSuffix
+
+func readFixtureProblems(t *testing.T, base string) []string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(base, checkerConfigName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+	if !strings.HasPrefix(content, checkerTestPrefix) || !strings.HasSuffix(content, checkerTestSuffix) {
+		t.Fatalf("changed configuration outside problems: %s", content)
+	}
+	raw := content[len(checkerTestPrefix) : len(content)-len(checkerTestSuffix)]
+	var entries []struct{ Name, Regex string }
+	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		name := regexp.QuoteMeta(e.Name)
+		want := "^" + name + `\\` + name + `\.(cpp|c|pas)$`
+		if e.Regex != want {
+			t.Fatalf("regex for %q = %q; want %q", e.Name, e.Regex, want)
+		}
+		names = append(names, e.Name)
+	}
+	return names
+}
+
+func TestScanAndPublishCheckerProblems(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(t.TempDir(), "stage")
 	for _, stem := range []string{
@@ -42,9 +75,10 @@ func TestGenerateProblemExtern(t *testing.T) {
 	putTestFile(t, root, "other_place/dice03.ans", "")
 	putTestFile(t, root, "numeric/01.in", "")
 	putTestFile(t, root, "orphan.ans", "")
-	putTestFile(t, root, problemListName, "from archive")
-	putTestFile(t, base, problemListName, "previous run")
-	if err := os.Chmod(filepath.Join(base, problemListName), 0444); err != nil {
+	putTestFile(t, root, checkerConfigName, "from archive")
+	putTestFile(t, base, checkerConfigName, emptyCheckerFixture)
+	putTestFile(t, base, "problem.extern", "legacy manifest")
+	if err := os.Chmod(filepath.Join(base, checkerConfigName), 0444); err != nil {
 		t.Fatal(err)
 	}
 	summary, err := scanProblems(root)
@@ -61,17 +95,26 @@ func TestGenerateProblemExtern(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	original, err := os.ReadFile(filepath.Join(dest, problemListName))
+	original, err := os.ReadFile(filepath.Join(dest, checkerConfigName))
 	if err != nil || string(original) != "from archive" {
 		t.Fatalf("changed archive member %q, err %v", original, err)
 	}
-	body, err := os.ReadFile(filepath.Join(base, problemListName))
-	if err != nil || string(body) != strings.Join(want, "\r\n")+"\r\n" {
-		t.Fatalf("output %q, err %v", body, err)
+	if got := readFixtureProblems(t, base); !reflect.DeepEqual(got, want) {
+		t.Fatalf("problems = %v; want %v", got, want)
+	}
+	info, err := os.Stat(filepath.Join(base, checkerConfigName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm()&0200 != 0 {
+		t.Fatal("read-only checker configuration became writable")
+	}
+	if body, err := os.ReadFile(filepath.Join(base, "problem.extern")); err != nil || string(body) != "legacy manifest" {
+		t.Fatalf("changed old problem.extern: %q, %v", body, err)
 	}
 }
 
-func TestInvalidDataPreservesProblemExtern(t *testing.T) {
+func TestScanRejectsInvalidData(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		paths []string
@@ -84,7 +127,6 @@ func TestInvalidDataPreservesProblemExtern(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
-			putTestFile(t, root, "problem.extern", "existing")
 			for _, p := range tc.paths {
 				putTestFile(t, root, p, "")
 			}
@@ -92,25 +134,21 @@ func TestInvalidDataPreservesProblemExtern(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("error %v, want %q", err, tc.want)
 			}
-			out, err := os.ReadFile(filepath.Join(root, "problem.extern"))
-			if err != nil || string(out) != "existing" {
-				t.Fatalf("previous output %q, err %v", out, err)
-			}
 		})
 	}
 }
 
-func TestProblemExternPreservesLinkTarget(t *testing.T) {
+func TestReplaceCheckerConfigPreservesLinkTarget(t *testing.T) {
 	root := t.TempDir()
 	otherDir := t.TempDir()
 	target := filepath.Join(otherDir, "keep.txt")
 	putTestFile(t, otherDir, "keep.txt", "untouched")
-	putTestFile(t, root, "new-list", "example\r\n")
-	dest := filepath.Join(root, problemListName)
+	putTestFile(t, root, "new-checker", emptyCheckerFixture)
+	dest := filepath.Join(root, checkerConfigName)
 	if err := os.Symlink(target, dest); err != nil {
 		t.Skipf("cannot create a symbolic link on this system: %v", err)
 	}
-	if err := replaceProblemList(filepath.Join(root, "new-list"), dest); err != nil {
+	if err := replaceCheckerConfig(filepath.Join(root, "new-checker"), dest); err != nil {
 		t.Fatal(err)
 	}
 	body, err := os.ReadFile(target)
@@ -121,6 +159,7 @@ func TestProblemExternPreservesLinkTarget(t *testing.T) {
 
 func TestPublishResultsWithinOneSecond(t *testing.T) {
 	base := t.TempDir()
+	putTestFile(t, base, checkerConfigName, emptyCheckerFixture)
 	stamp := time.Date(2026, 11, 24, 14, 30, 52, 0, time.Local)
 	first := "down20261124_143052"
 	if err := os.Mkdir(filepath.Join(base, first), 0700); err != nil {
@@ -157,25 +196,43 @@ func TestPublishResultsWithinOneSecond(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	list, err := os.ReadFile(filepath.Join(base, problemListName))
-	if err != nil || (string(list) != "red\r\n" && string(list) != "blue\r\n") {
-		t.Fatalf("incomplete manifest: %q, %v", list, err)
+	if got := readFixtureProblems(t, base); len(got) != 1 || (got[0] != "red" && got[0] != "blue") {
+		t.Fatalf("incomplete checker configuration: %v", got)
 	}
 }
 
-func TestPublishRollsBackWhenListCannotBeReplaced(t *testing.T) {
-	base := t.TempDir()
-	putTestFile(t, base, problemListName+"/keep.txt", "keep")
-	stage := filepath.Join(t.TempDir(), "stage")
-	putTestFile(t, stage, "sum1.in", "1")
-	if _, err := publishResult(base, stage, []string{"sum"}, time.Now()); err == nil {
-		t.Fatal("expected publication to fail with a directory in the manifest's place")
-	}
-	entries, err := os.ReadDir(base)
-	if err != nil || len(entries) != 1 || entries[0].Name() != problemListName {
-		t.Fatalf("partial publication: %v, %v", entries, err)
-	}
-	if got, err := os.ReadFile(filepath.Join(base, problemListName, "keep.txt")); err != nil || string(got) != "keep" {
-		t.Fatalf("original content changed: %q, %v", got, err)
+func TestPublishPreservesInvalidOrMissingChecker(t *testing.T) {
+	for _, tc := range []struct{ name, existing, content string }{
+		{"missing", "", ""},
+		{"invalid JSON", checkerConfigName, `{"problems":[}`},
+		{"directory", checkerConfigName + "/keep.txt", "keep"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			if tc.existing != "" {
+				putTestFile(t, base, tc.existing, tc.content)
+			}
+			stage := filepath.Join(t.TempDir(), "stage")
+			putTestFile(t, stage, "sum1.in", "1")
+			if _, err := publishResult(base, stage, []string{"sum"}, time.Now()); err == nil {
+				t.Fatal("expected publication to fail")
+			}
+			entries, err := os.ReadDir(base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.existing == "" {
+				if len(entries) != 0 {
+					t.Fatalf("created unexpected output: %v", entries)
+				}
+				return
+			}
+			if len(entries) != 1 || entries[0].Name() != checkerConfigName {
+				t.Fatalf("partial publication: %v", entries)
+			}
+			if got, err := os.ReadFile(filepath.Join(base, tc.existing)); err != nil || string(got) != tc.content {
+				t.Fatalf("original content changed: %q, %v", got, err)
+			}
+		})
 	}
 }
